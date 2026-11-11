@@ -1,0 +1,33 @@
+# ESP-IDF generated files
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+
+# IDE and local tools
+.vscode/
+.idea/
+.cache/
+.codex/
+.agents/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local credentials and firmware signing/encryption keys
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+flash_encryption_key.bin
+secure_boot_signing_key.*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
