@@ -10,7 +10,6 @@ enum class PageId {
     Note,
     Imu,
     Microphone,
-    Hello,
 };
 
 struct DateTimeState {

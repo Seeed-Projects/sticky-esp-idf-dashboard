@@ -10,7 +10,6 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_sleep.h"
-#include "hello_page.h"
 #include "home_page.h"
 #include "imu_page.h"
 #include "microphone_page.h"
@@ -53,8 +52,6 @@ const char *page_name(PageId page)
         return "IMU";
     case PageId::Microphone:
         return "Microphone";
-    case PageId::Hello:
-        return "Hello";
     }
     return "Unknown";
 }
@@ -110,9 +107,6 @@ void render_current_page(Canvas &canvas, const AppState &state)
     case PageId::Microphone:
         renderer = microphone_page_render;
         break;
-    case PageId::Hello:
-        renderer = hello_page_render;
-        break;
     }
 
     if (renderer != nullptr) {
@@ -124,7 +118,7 @@ void select_previous_page(AppState &state)
 {
     switch (state.current_page) {
     case PageId::Home:
-        state.current_page = PageId::Hello;
+        state.current_page = PageId::Microphone;
         break;
     case PageId::Sensor:
         state.current_page = PageId::Home;
@@ -140,9 +134,6 @@ void select_previous_page(AppState &state)
         break;
     case PageId::Microphone:
         state.current_page = PageId::Imu;
-        break;
-    case PageId::Hello:
-        state.current_page = PageId::Microphone;
         break;
     }
 }
@@ -166,9 +157,6 @@ void select_next_page(AppState &state)
         state.current_page = PageId::Microphone;
         break;
     case PageId::Microphone:
-        state.current_page = PageId::Hello;
-        break;
-    case PageId::Hello:
         state.current_page = PageId::Home;
         break;
     }

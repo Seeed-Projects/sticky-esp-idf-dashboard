@@ -17,7 +17,6 @@ idf_component_register(
          # Page framework
          "pages/page.cpp"
          "pages/home_page.cpp"
-         "pages/hello_page.cpp"
 
          # Buttons, buzzer, and touch gestures
          "devices/sticky_buttons.cpp"
