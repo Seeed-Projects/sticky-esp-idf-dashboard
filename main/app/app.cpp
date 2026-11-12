@@ -4,12 +4,15 @@
 #include <cstring>
 
 #include "app_data.h"
+#include "app_clock.h"
+#include "sticky_imu.h"
 #include "canvas.h"
 #include "battery_page.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_sleep.h"
+#include "esp_timer.h"
 #include "home_page.h"
 #include "imu_page.h"
 #include "microphone_page.h"
@@ -26,14 +29,27 @@
 namespace {
 
 constexpr char kTag[] = "app";
-constexpr uint32_t kSavedStateMagic = 0x53544943U;  // "STIC"
+constexpr uint32_t kSavedStateMagic = 0x53544933U;  // Version 3: Note truncation metadata.
 
 RTC_NOINIT_ATTR uint32_t s_saved_state_magic;
 RTC_NOINIT_ATTR uint8_t s_saved_state[sizeof(AppState)];
+RTC_NOINIT_ATTR uint32_t s_saved_state_size;
+RTC_NOINIT_ATTR uint32_t s_saved_state_checksum;
+
+uint32_t saved_state_checksum()
+{
+    uint32_t checksum = 2166136261U;
+    for (uint8_t byte : s_saved_state) {
+        checksum = (checksum ^ byte) * 16777619U;
+    }
+    return checksum;
+}
 
 void save_app_state_for_deep_sleep(const AppState &state)
 {
     std::memcpy(s_saved_state, &state, sizeof(state));
+    s_saved_state_size = sizeof(state);
+    s_saved_state_checksum = saved_state_checksum();
     s_saved_state_magic = kSavedStateMagic;
 }
 
@@ -73,12 +89,21 @@ esp_err_t refresh_current_page(const AppState &state)
 bool restore_app_state_after_deep_sleep(AppState &state)
 {
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1 ||
-        s_saved_state_magic != kSavedStateMagic) {
+        s_saved_state_magic != kSavedStateMagic ||
+        s_saved_state_size != sizeof(state) ||
+        s_saved_state_checksum != saved_state_checksum()) {
         return false;
     }
 
-    std::memcpy(&state, s_saved_state, sizeof(state));
+    AppState restored;
+    std::memcpy(&restored, s_saved_state, sizeof(restored));
     s_saved_state_magic = 0;
+    if (restored.current_page < PageId::Home ||
+        restored.current_page > PageId::Microphone) {
+        return false;
+    }
+    restored.note.text[sizeof(restored.note.text) - 1U] = '\0';
+    state = restored;
     ESP_LOGI(kTag, "Restored %s Page state after deep sleep",
              page_name(state.current_page));
     return true;
@@ -183,13 +208,25 @@ esp_err_t handle_app_event(Canvas &canvas,
 
         // Home is the gray4 demonstration page and has no RTC status bar.
         if (page_uses_gray4(state.current_page)) {
-            ESP_LOGI(kTag, "Skipping RTC partial refresh on gray4 Home Page");
+            ESP_LOGD(kTag, "Skipping RTC partial refresh on gray4 Home Page");
             return ESP_OK;
         }
 
         status_bar_render_time(canvas, state);
-        ESP_LOGI(kTag, "Partially refreshing RTC time");
-        return sticky_display_refresh_partial();
+        const int64_t start_us = esp_timer_get_time();
+        const esp_err_t result = sticky_display_refresh_partial();
+        if (result == ESP_OK) {
+            if (state.date_time.valid) {
+                ESP_LOGI(kTag, "RTC updated: %02d:%02d, %s, elapsed=%lld ms",
+                         state.date_time.hour, state.date_time.minute,
+                         sticky_display_last_refresh_mode(),
+                         static_cast<long long>((esp_timer_get_time() - start_us) / 1000));
+            } else {
+                ESP_LOGI(kTag, "RTC status displayed: --:--, %s",
+                         sticky_display_last_refresh_mode());
+            }
+        }
+        return result;
     }
 
     const PageId previous_page = state.current_page;
@@ -207,6 +244,13 @@ esp_err_t handle_app_event(Canvas &canvas,
         ESP_RETURN_ON_ERROR(
             sticky_display_refresh_monochrome(),
             "app", "refresh deep sleep page");
+        ESP_RETURN_ON_ERROR(
+            app_clock_stop(), "app", "stop minute timer");
+        const esp_err_t imu_stop = sticky_imu_stop_monitoring();
+        if (imu_stop != ESP_OK) {
+            ESP_LOGW(kTag, "IMU power-down failed: %s", esp_err_to_name(imu_stop));
+            return imu_stop;
+        }
         ESP_RETURN_ON_ERROR(
             sticky_touch_stop(), "app", "stop touch polling");
         ESP_RETURN_ON_ERROR(
@@ -241,7 +285,7 @@ esp_err_t handle_app_event(Canvas &canvas,
         ESP_LOGI(kTag, "Refreshing %s Page", page_name(state.current_page));
     }
 
-    ESP_LOGI(kTag, "Rendering %s Page", page_name(state.current_page));
+    ESP_LOGD(kTag, "Rendering %s Page", page_name(state.current_page));
 
     // RTC failure changes only the status bar; page rendering still proceeds.
     update_date_time(state);
@@ -255,16 +299,23 @@ esp_err_t handle_app_event(Canvas &canvas,
         // SD is unmounted before render_current_page() refreshes the display.
         update_note(state);
     } else if (state.current_page == PageId::Imu) {
+        const ImuState previous_imu = state.imu;
         update_imu(state);
+        if (orientation_event && previous_imu.valid == state.imu.valid &&
+            previous_imu.orientation == state.imu.orientation) {
+            return ESP_OK;
+        }
     } else if (state.current_page == PageId::Microphone &&
                event == AppEvent::RefreshPage) {
         update_microphone(state);
     }
 
     render_current_page(canvas, state);
+    const int64_t refresh_start_us = esp_timer_get_time();
     ESP_RETURN_ON_ERROR(
         refresh_current_page(state), "app", "refresh current page");
-    ESP_LOGI(kTag, "%s Page display refresh completed",
-             page_name(state.current_page));
+    ESP_LOGI(kTag, "%s displayed: %s, elapsed=%lld ms",
+             page_name(state.current_page), sticky_display_last_refresh_mode(),
+             static_cast<long long>((esp_timer_get_time() - refresh_start_us) / 1000));
     return orientation_event ? ESP_OK : sticky_buzzer_beep();
 }

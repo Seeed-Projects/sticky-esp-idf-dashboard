@@ -20,6 +20,7 @@ constexpr char kMountPoint[] = "/sdcard";
 constexpr TickType_t kPowerOnDelay = pdMS_TO_TICKS(100);
 
 bool s_initialized = false;
+esp_err_t s_cleanup_error = ESP_OK;
 
 esp_err_t set_card_power(bool enabled)
 {
@@ -32,28 +33,53 @@ bool card_is_inserted()
     return gpio_get_level(static_cast<gpio_num_t>(PIN_SD_DETECT)) == 0;
 }
 
-esp_err_t read_file(const char *path, char *buffer, size_t buffer_size)
+esp_err_t read_file(const char *path, char *buffer, size_t buffer_size,
+                    StickySdReadResult &details)
 {
+    details.status = StickySdStatus::ReadFailed;
     FILE *file = std::fopen(path, "rb");
     if (file == nullptr) {
+        const int open_error = errno;
         ESP_LOGE(kTag, "Open %s failed: errno=%d (%s)",
-                 path, errno, std::strerror(errno));
-        return ESP_ERR_NOT_FOUND;
+                 path, open_error, std::strerror(open_error));
+        if (open_error == ENOENT) {
+            details.status = StickySdStatus::MissingFile;
+            return ESP_ERR_NOT_FOUND;
+        }
+        return ESP_FAIL;
     }
 
     const size_t bytes_read =
         std::fread(buffer, 1, buffer_size - 1U, file);
+    const bool truncated = std::fgetc(file) != EOF;
     const bool read_failed = std::ferror(file) != 0;
-    std::fclose(file);
+    const bool close_failed = std::fclose(file) != 0;
     buffer[bytes_read] = '\0';
+    details.bytes_read = bytes_read;
+    details.truncated = truncated;
 
-    if (read_failed) {
+    if (read_failed || close_failed) {
         ESP_LOGE(kTag, "Read %s failed", path);
         return ESP_FAIL;
     }
 
-    ESP_LOGI(kTag, "Read %u bytes from %s: %s",
-             static_cast<unsigned>(bytes_read), path, buffer);
+    bool blank = true;
+    for (size_t index = 0; index < bytes_read; ++index) {
+        const unsigned char value = static_cast<unsigned char>(buffer[index]);
+        // The bundled font supports printable ASCII only. Make unsupported
+        // bytes visible instead of allowing embedded NUL to hide the suffix.
+        if (value != '\r' && value != '\n' && value != '\t' &&
+            (value < 32U || value > 126U)) {
+            buffer[index] = '?';
+        }
+        blank = blank && (buffer[index] == ' ' || buffer[index] == '\r' ||
+                          buffer[index] == '\n' || buffer[index] == '\t');
+    }
+    details.status = bytes_read == 0 ? StickySdStatus::Empty
+                     : blank ? StickySdStatus::Blank
+                     : truncated ? StickySdStatus::Truncated : StickySdStatus::Ready;
+    ESP_LOGI(kTag, "Read %u bytes from %s; truncated=%d",
+             static_cast<unsigned>(bytes_read), path, truncated);
     return ESP_OK;
 }
 
@@ -101,8 +127,15 @@ esp_err_t sticky_sdcard_init()
 
 esp_err_t sticky_sdcard_read_text(const char *file_name,
                                   char *buffer,
-                                  size_t buffer_size)
+                                  size_t buffer_size,
+                                  StickySdReadResult *details)
 {
+    StickySdReadResult local_details;
+    StickySdReadResult &info = details != nullptr ? *details : local_details;
+    info = {};
+    if (buffer != nullptr && buffer_size > 0) {
+        buffer[0] = '\0';
+    }
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -111,7 +144,16 @@ esp_err_t sticky_sdcard_read_text(const char *file_name,
     }
     buffer[0] = '\0';
 
+    if (s_cleanup_error != ESP_OK) {
+        // IDF may already free the card/context before returning an unmount
+        // error. Do not reuse that pointer or remount an uncertain VFS state.
+        info.cleanup_error = s_cleanup_error;
+        info.status = StickySdStatus::CleanupFailed;
+        return s_cleanup_error;
+    }
+
     if (!card_is_inserted()) {
+        info.status = StickySdStatus::NoCard;
         set_card_power(false);
         ESP_LOGW(kTag, "No MicroSD card detected");
         return ESP_ERR_NOT_FOUND;
@@ -148,6 +190,7 @@ esp_err_t sticky_sdcard_read_text(const char *file_name,
         kMountPoint, &host, &slot_config, &mount_config, &card);
     if (result != ESP_OK) {
         ESP_LOGE(kTag, "MicroSD mount failed: %s", esp_err_to_name(result));
+        info.status = StickySdStatus::MountFailed;
         gpio_set_level(static_cast<gpio_num_t>(PIN_SD_CS), 1);
         if (!card_is_inserted()) {
             set_card_power(false);
@@ -161,19 +204,27 @@ esp_err_t sticky_sdcard_read_text(const char *file_name,
     if (path_length <= 0 || static_cast<size_t>(path_length) >= sizeof(path)) {
         result = ESP_ERR_INVALID_SIZE;
     } else {
-        result = read_file(path, buffer, buffer_size);
+        result = read_file(path, buffer, buffer_size, info);
     }
 
     const esp_err_t unmount_result =
         esp_vfs_fat_sdcard_unmount(kMountPoint, card);
+    info.cleanup_error = unmount_result;
+    s_cleanup_error = unmount_result;
+    if (unmount_result != ESP_OK) {
+        info.status = StickySdStatus::CleanupFailed;
+        ESP_LOGE(kTag, "MicroSD unmount failed: %s", esp_err_to_name(unmount_result));
+    }
     if (result == ESP_OK && unmount_result != ESP_OK) {
         result = unmount_result;
     }
 
     gpio_set_level(static_cast<gpio_num_t>(PIN_SD_CS), 1);
-    if (!card_is_inserted()) {
+    if (unmount_result == ESP_OK && !card_is_inserted()) {
         set_card_power(false);
     }
-    ESP_LOGI(kTag, "MicroSD unmounted; shared SPI2 is ready for display refresh");
+    if (unmount_result == ESP_OK) {
+        ESP_LOGD(kTag, "MicroSD unmounted");
+    }
     return result;
 }

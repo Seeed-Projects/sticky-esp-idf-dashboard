@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "pin_config.h"
+#include "sticky_sht40.h"
 
 namespace {
 
@@ -25,6 +26,38 @@ spi_device_handle_t s_spi_device = nullptr;
 uint8_t *s_framebuffer = nullptr;
 uint8_t *s_rotated_framebuffer = nullptr;
 Canvas *s_canvas = nullptr;
+constexpr unsigned kPartialRefreshLimit = 20;
+unsigned s_partial_refresh_count = 0;
+bool s_refresh_failed = true;
+bool s_spi_bus_initialized = false;
+bool s_standby_pending = false;
+bool s_last_refresh_gray4 = false;
+const char *s_last_refresh_mode = "none";
+seeed_epaper_panel_model_t s_model = SEEED_EPAPER_PANEL_SSD1677;
+
+esp_err_t finish_refresh(esp_err_t result, bool partial, bool gray4 = false)
+{
+    s_refresh_failed = result != ESP_OK;
+    if (result != ESP_OK) {
+        ESP_LOGE("sticky_display", "Refresh failed: %s; next update requires full refresh",
+                 esp_err_to_name(result));
+        return result;
+    }
+    seeed_epaper_refresh_timing_t timing = {};
+    if (seeed_epaper_panel_get_last_refresh_timing(s_panel, &timing) == ESP_OK &&
+        timing.temperature_valid) {
+        ESP_LOGD("sticky_display", "Waveform temperature=%u C source=%s",
+                 static_cast<unsigned>(timing.temperature_c),
+                 timing.temperature_external ? "SHT40" : "internal");
+    }
+    s_partial_refresh_count = partial ? s_partial_refresh_count + 1U : 0U;
+    s_last_refresh_gray4 = gray4;
+    s_last_refresh_mode = gray4 ? "gray4 full" : partial ? "mono partial" : "mono full";
+    // Match the official lifecycle: standby is an idle action, not part of
+    // every refresh. The app calls it once the event queue becomes idle.
+    s_standby_pending = true;
+    return ESP_OK;
+}
 
 uint8_t reverse_pixel_order(uint8_t packed_pixels)
 {
@@ -72,7 +105,7 @@ void convert_gray4_to_monochrome_in_place(uint8_t *buffer)
 
 }  // namespace
 
-esp_err_t sticky_display_init()
+static esp_err_t initialize_display()
 {
     if (s_panel != nullptr && s_canvas != nullptr) {
         return ESP_OK;
@@ -106,6 +139,7 @@ esp_err_t sticky_display_init()
     bus_config.max_transfer_sz = kStickyDisplayWidth * kStickyDisplayHeight / 8;
     ESP_RETURN_ON_ERROR(spi_bus_initialize(SPI2_HOST, &bus_config, SPI_DMA_CH_AUTO),
                         "sticky_display", "initialize SPI2");
+    s_spi_bus_initialized = true;
 
     spi_device_interface_config_t device_config = {};
     device_config.clock_speed_hz = 10 * 1000 * 1000;
@@ -143,6 +177,7 @@ esp_err_t sticky_display_init()
     seeed_epaper_panel_model_t detected_model;
     ESP_RETURN_ON_ERROR(seeed_epaper_panel_get_model(s_panel, &detected_model),
                         "sticky_display", "get detected panel model");
+    s_model = detected_model;
     ESP_LOGI("sticky_display", "Detected e-paper controller: %s",
              detected_model == SEEED_EPAPER_PANEL_SSD2677 ? "SSD2677" : "SSD1677");
 
@@ -168,12 +203,53 @@ esp_err_t sticky_display_init()
         return ESP_ERR_NO_MEM;
     }
     s_canvas->clear();
+    // Match the official board's startup temperature source. If SHT40 is
+    // unavailable, leave the component's internal-temperature fallback intact.
+    Sht40Reading temperature = {};
+    if (sticky_sht40_read(temperature) == ESP_OK) {
+        ESP_RETURN_ON_ERROR(seeed_epaper_panel_set_external_temperature(
+            s_panel, temperature.temperature_c), "sticky_display", "set panel temperature");
+        ESP_LOGI("sticky_display", "Waveform temperature: SHT40 %.1f C",
+                 static_cast<double>(temperature.temperature_c));
+    } else {
+        ESP_LOGW("sticky_display", "Waveform temperature: controller internal fallback");
+    }
     return ESP_OK;
+}
+
+esp_err_t sticky_display_init()
+{
+    const esp_err_t result = initialize_display();
+    if (result == ESP_OK) return ESP_OK;
+    delete s_canvas;
+    s_canvas = nullptr;
+    heap_caps_free(s_framebuffer);
+    heap_caps_free(s_rotated_framebuffer);
+    s_framebuffer = nullptr;
+    s_rotated_framebuffer = nullptr;
+    if (s_panel != nullptr) {
+        seeed_epaper_panel_del(s_panel);
+        s_panel = nullptr;
+    }
+    if (s_spi_device != nullptr) {
+        spi_bus_remove_device(s_spi_device);
+        s_spi_device = nullptr;
+    }
+    if (s_spi_bus_initialized) {
+        spi_bus_free(SPI2_HOST);
+        s_spi_bus_initialized = false;
+    }
+    return result;
 }
 
 Canvas *sticky_display_canvas()
 {
     return s_canvas;
+}
+
+const char *sticky_display_last_refresh_mode()
+{
+    return s_last_refresh_mode;
 }
 
 esp_err_t sticky_display_refresh()
@@ -187,15 +263,21 @@ esp_err_t sticky_display_refresh()
     const seeed_epaper_area_t full_screen = {
         0, 0, kStickyDisplayWidth, kStickyDisplayHeight,
     };
-    ESP_RETURN_ON_ERROR(
-        seeed_epaper_panel_write_bitmap_gray4(
-            s_panel, &full_screen, s_rotated_framebuffer, s_canvas->stride()),
-        "sticky_display", "write gray4 framebuffer");
-    return seeed_epaper_panel_commit(s_panel, &full_screen, SEEED_EPAPER_REFRESH_GRAY4);
+    const esp_err_t write_result = seeed_epaper_panel_write_bitmap_gray4(
+        s_panel, &full_screen, s_rotated_framebuffer, s_canvas->stride());
+    if (write_result != ESP_OK) return finish_refresh(write_result, false);
+    ESP_LOGD("sticky_display", "Refresh: Gray4 full");
+    return finish_refresh(seeed_epaper_panel_commit(
+        s_panel, &full_screen, SEEED_EPAPER_REFRESH_GRAY4), false, true);
 }
 
 esp_err_t sticky_display_refresh_partial()
 {
+    if (s_refresh_failed || s_partial_refresh_count >= kPartialRefreshLimit) {
+        ESP_LOGI("sticky_display", "Promote partial to full: recovery=%d count=%u",
+                 s_refresh_failed, s_partial_refresh_count);
+        return sticky_display_refresh_monochrome();
+    }
     if (s_panel == nullptr || s_canvas == nullptr ||
         s_rotated_framebuffer == nullptr) {
         return ESP_ERR_INVALID_STATE;
@@ -210,13 +292,15 @@ esp_err_t sticky_display_refresh_partial()
     const seeed_epaper_area_t full_screen = {
         0, 0, kStickyDisplayWidth, kStickyDisplayHeight,
     };
-    return seeed_epaper_panel_refresh_area(
+    ESP_LOGD("sticky_display", "Refresh: monochrome partial (%u/%u)",
+             s_partial_refresh_count + 1U, kPartialRefreshLimit);
+    return finish_refresh(seeed_epaper_panel_refresh_area(
         s_panel,
         &full_screen,
         s_rotated_framebuffer,
         kMonochromeStride,
         SEEED_EPAPER_PIXEL_FORMAT_MONO1_MSB,
-        SEEED_EPAPER_REFRESH_PARTIAL);
+        SEEED_EPAPER_REFRESH_PARTIAL), true);
 }
 
 esp_err_t sticky_display_refresh_monochrome()
@@ -232,13 +316,14 @@ esp_err_t sticky_display_refresh_monochrome()
     const seeed_epaper_area_t full_screen = {
         0, 0, kStickyDisplayWidth, kStickyDisplayHeight,
     };
-    return seeed_epaper_panel_refresh_area(
+    ESP_LOGD("sticky_display", "Refresh: monochrome full");
+    return finish_refresh(seeed_epaper_panel_refresh_area(
         s_panel,
         &full_screen,
         s_rotated_framebuffer,
         kMonochromeStride,
         SEEED_EPAPER_PIXEL_FORMAT_MONO1_MSB,
-        SEEED_EPAPER_REFRESH_FULL);
+        SEEED_EPAPER_REFRESH_FULL), false);
 }
 
 esp_err_t sticky_display_clear()
@@ -247,7 +332,8 @@ esp_err_t sticky_display_clear()
         return ESP_ERR_INVALID_STATE;
     }
     s_canvas->clear();
-    return seeed_epaper_panel_clear(s_panel, true, SEEED_EPAPER_REFRESH_FULL);
+    return finish_refresh(seeed_epaper_panel_clear(
+        s_panel, true, SEEED_EPAPER_REFRESH_FULL), false);
 }
 
 esp_err_t sticky_display_sleep()
@@ -259,5 +345,35 @@ esp_err_t sticky_display_sleep()
     ESP_RETURN_ON_ERROR(
         seeed_epaper_panel_sleep(s_panel),
         "sticky_display", "put panel to sleep");
-    return gpio_set_level(static_cast<gpio_num_t>(PIN_EPD_EN), 0);
+    s_standby_pending = false;
+    // Keep the panel rail enabled after its documented deep-sleep command,
+    // as in the official firmware. Avoid an extra abrupt rail shutdown.
+    return ESP_OK;
+}
+
+esp_err_t sticky_display_standby()
+{
+    if (s_panel == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_standby_pending) {
+        return ESP_OK;
+    }
+    // SSD1677 Gray4 uses 0xD7, which already disables analog/clock. The
+    // additional 0x03 standby sequence times out on the tested board. Keep
+    // the official driver unchanged and omit that redundant app-level job.
+    if (s_model == SEEED_EPAPER_PANEL_SSD1677 && s_last_refresh_gray4) {
+        s_standby_pending = false;
+        return ESP_OK;
+    }
+    const esp_err_t result = seeed_epaper_panel_standby(s_panel);
+    // A failed idle transition must not block input again every second.
+    // The next full refresh rebuilds the component's invalidated session.
+    s_standby_pending = false;
+    if (result == ESP_OK) {
+        ESP_LOGD("sticky_display", "Display entered idle standby");
+    } else {
+        s_refresh_failed = true;
+    }
+    return result;
 }

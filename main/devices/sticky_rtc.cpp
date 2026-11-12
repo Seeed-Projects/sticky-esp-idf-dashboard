@@ -70,8 +70,9 @@ esp_err_t sticky_rtc_init(i2c_master_bus_handle_t bus)
     return result;
 }
 
-esp_err_t sticky_rtc_read(RtcDateTime &date_time)
+static esp_err_t read_time(RtcDateTime &date_time, bool &invalid_time)
 {
+    invalid_time = false;
     if (s_device == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -86,6 +87,7 @@ esp_err_t sticky_rtc_read(RtcDateTime &date_time)
 
     // PCF8563 sets VL when the clock integrity is not guaranteed.
     if ((raw[0] & kLowVoltageFlag) != 0U) {
+        invalid_time = true;
         ESP_LOGW(kTag, "RTC time invalid: low-voltage flag is set");
         return ESP_ERR_INVALID_STATE;
     }
@@ -98,6 +100,7 @@ esp_err_t sticky_rtc_read(RtcDateTime &date_time)
     const uint8_t year = raw[6];
     if (!valid_bcd(second) || !valid_bcd(minute) || !valid_bcd(hour) ||
         !valid_bcd(day) || !valid_bcd(month) || !valid_bcd(year)) {
+        invalid_time = true;
         ESP_LOGW(kTag, "RTC time invalid: malformed BCD data");
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -113,13 +116,42 @@ esp_err_t sticky_rtc_read(RtcDateTime &date_time)
                                         : 2000 + short_year;
 
     if (!valid_date_time(value)) {
+        invalid_time = true;
         ESP_LOGW(kTag, "RTC time invalid: value is out of range");
         return ESP_ERR_INVALID_RESPONSE;
     }
 
     date_time = value;
-    ESP_LOGI(kTag, "Read success: %04d-%02d-%02d %02d:%02d:%02d",
+    ESP_LOGD(kTag, "Read success: %04d-%02d-%02d %02d:%02d:%02d",
              value.year, value.month, value.day,
              value.hour, value.minute, value.second);
     return ESP_OK;
+}
+
+esp_err_t sticky_rtc_read(RtcDateTime &date_time)
+{
+    bool invalid_time = false;
+    return read_time(date_time, invalid_time);
+}
+
+esp_err_t sticky_rtc_initialize_time()
+{
+    RtcDateTime current;
+    bool invalid_time = false;
+    const esp_err_t result = read_time(current, invalid_time);
+    if (!invalid_time) {
+        return result;  // Includes a valid clock, missing device, and bus errors.
+    }
+
+    // Same register layout/BCD encoding as official pcf8563_set_time().
+    // Jan 1, 2026 is Thursday (weekday 4). Writing seconds with bit 7 clear
+    // clears VL; the readback still checks whether the clock accepted it.
+    constexpr uint8_t payload[] = {0x02, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x26};
+    ESP_LOGW(kTag, "RTC invalid; setting demo time 2026-01-01 00:00:00 (not synchronized)");
+    const esp_err_t write_result = i2c_master_transmit(
+        s_device, payload, sizeof(payload), kI2cTimeoutMs);
+    if (write_result != ESP_OK) {
+        return write_result;
+    }
+    return sticky_rtc_read(current);
 }

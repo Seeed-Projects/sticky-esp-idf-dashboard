@@ -280,7 +280,9 @@ static esp_err_t ssd2677_power_refresh(seeed_epaper_panel_t *panel,
     refresh_ms = driver_elapsed_ms(t);
     panel->last_refresh_timing.refresh_ms = (uint32_t)refresh_ms;
 
-    if (mode != SEEED_EPAPER_REFRESH_PARTIAL) {
+    /* Partial refresh already keeps power on; full refresh now does the same. */
+    if (mode != SEEED_EPAPER_REFRESH_PARTIAL &&
+        mode != SEEED_EPAPER_REFRESH_FULL) {
         t = driver_log_us();
         ESP_RETURN_ON_ERROR(seeed_epaper_panel_write_command(panel, 0x02), TAG, "power off failed");
         ESP_RETURN_ON_ERROR(seeed_epaper_panel_write_data(panel, &zero, 1), TAG, "power off data failed");
@@ -583,7 +585,7 @@ static esp_err_t ssd2677_refresh(seeed_epaper_panel_t *panel, seeed_epaper_refre
     APP_EPAPER_DEBUG_LOGI(TAG, "[perf] refresh phase2-stream=%llums",
                           (unsigned long long)stream_ms);
 
-    /* Keep high voltage enabled across consecutive partial refreshes. */
+    /* Keep high voltage enabled after mono full and partial refreshes. */
     phase_ms = driver_log_ms();
     ESP_RETURN_ON_ERROR(ssd2677_power_refresh(panel, mode), TAG, "refresh sequence failed");
     drive_ms = driver_log_ms() - phase_ms;

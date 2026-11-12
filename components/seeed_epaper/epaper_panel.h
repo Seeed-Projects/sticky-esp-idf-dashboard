@@ -168,8 +168,6 @@ esp_err_t seeed_epaper_panel_resume(seeed_epaper_panel_handle_t panel);
 esp_err_t seeed_epaper_panel_wakeup(seeed_epaper_panel_handle_t panel,
                                     seeed_epaper_refresh_mode_t mode);
 
-bool seeed_epaper_panel_busy_wait_active(void);
-
 #ifdef __cplusplus
 }
 #endif

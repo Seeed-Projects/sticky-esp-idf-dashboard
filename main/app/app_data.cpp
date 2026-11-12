@@ -52,7 +52,7 @@ void update_date_time(AppState &state)
 
 void update_environment(AppState &state)
 {
-    ESP_LOGI(kTag, "Updating environment data");
+    ESP_LOGD(kTag, "Updating environment data");
     Sht40Reading reading = {};
     const esp_err_t result = sticky_sht40_read(reading);
 
@@ -61,7 +61,7 @@ void update_environment(AppState &state)
     if (result == ESP_OK) {
         state.environment.temperature_c = reading.temperature_c;
         state.environment.humidity_percent = reading.humidity_percent;
-        ESP_LOGI(kTag, "State updated: temperature=%.2f C, humidity=%.2f %%",
+        ESP_LOGD(kTag, "State updated: temperature=%.2f C, humidity=%.2f %%",
                  static_cast<double>(state.environment.temperature_c),
                  static_cast<double>(state.environment.humidity_percent));
     } else {
@@ -92,7 +92,7 @@ void update_battery(AppState &state)
 void update_note(AppState &state)
 {
     const esp_err_t result = sticky_sdcard_read_text(
-        "TEST.TXT", state.note.text, sizeof(state.note.text));
+        "TEST.TXT", state.note.text, sizeof(state.note.text), &state.note.result);
     state.note.error = result;
     state.note.valid = result == ESP_OK;
     if (result != ESP_OK) {

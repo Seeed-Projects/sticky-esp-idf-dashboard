@@ -92,8 +92,9 @@ esp_err_t board_init()
         return result;
     }
 
-    // MicroSD and the e-paper panel share SPI2. Keep the unused SD card
-    // deselected and powered off before the display takes ownership of SPI2.
+    // MicroSD and the e-paper panel share SPI2. Keep SD deselected during
+    // display initialization. SD_EN is active high; sticky_sdcard_init()
+    // powers the card off later, before the first SD access.
     result = configure_output(static_cast<gpio_num_t>(PIN_SD_CS), 1);
     if (result != ESP_OK) {
         return result;

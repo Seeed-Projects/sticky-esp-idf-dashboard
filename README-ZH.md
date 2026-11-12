@@ -6,6 +6,10 @@
 
 你既可以直接烧录并体验完整 Demo，也可以参考其中的设备模块开发自己的 Sticky 应用。工程将硬件访问、应用状态和页面绘制分开，各个驱动模块可以独立复用，不需要复制整套 UI。
 
+**同一份固件自动识别 SSD1677 和 SSD2677**，并选择对应驱动。两种屏幕共用相同的 Canvas 和刷新 API，无需手动选择控制器。
+
+三篇 ESP-IDF 教程：[开发基础](https://www.seeedstudio.com/sticky/docs/zh/device-guide/esp-basics/)、[页面与外设](https://www.seeedstudio.com/sticky/docs/zh/device-guide/esp-pages/)、[刷新与低功耗](https://www.seeedstudio.com/sticky/docs/zh/device-guide/esp-refresh/)。
+
 ## 功能
 
 Dashboard 包含六个页面：
@@ -66,7 +70,7 @@ TEST.TXT
 Hello Sticky! Happy coding!
 ```
 
-Demo 最多读取 256 个字符。内置点阵字体面向可打印 ASCII 字符，因此建议使用 ASCII 文本。
+Demo 最多读取 **256 字节**，最多显示 6 行，每行 52 个单字节字符。建议使用可打印 ASCII；不支持的字节替换为 `?`。超长内容只显示部分，文件截断信息记录在日志中。正常读取只显示正文，不显示底部说明。无卡、挂载失败、缺文件、空文件、空白内容和读取失败有不同提示；不会自动格式化卡。
 
 ## 操作方式
 
@@ -82,10 +86,12 @@ Demo 最多读取 256 个字符。内置点阵字体面向可打印 ASCII 字符
 
 触摸只识别水平滑动。单击、短距离移动以及以垂直方向为主的手势会被忽略，以减少误触翻页。
 
+已接受的翻页处理完成前，重复翻页请求会合并，快速连续滑动不会积压成稍后连翻多页。电子纸波形本身仍需要时间。用于唤醒的持续按压不会再次触发休眠；先松手，再开始下一次按压。唤醒有蜂鸣提示，不要求按满一秒。
+
 ## 工程结构
 
 ```text
-reTerminal-Sticky-Dashboard-Demo/
+sticky-esp-idf-dashboard/
 |-- components/                 第三方组件和屏幕组件
 |   |-- bq27220/
 |   |-- button/
@@ -121,16 +127,16 @@ reTerminal-Sticky-Dashboard-Demo/
 
 | 模块 | 主要 API | 用途 |
 | --- | --- | --- |
-| `sticky_display` | `init`、`canvas`、`refresh`、`refresh_partial`、`sleep` | 电子纸 Framebuffer 和刷新 |
+| `sticky_display` | `init`、`canvas`、`refresh`、`refresh_monochrome`、`refresh_partial`、`standby`、`sleep` | Framebuffer 和三种刷新模式 |
 | `sticky_buttons` | `init` | UP、DOWN 和 AI 按键事件 |
 | `sticky_touch` | `init`、`stop` | GT911 滑动事件 |
 | `sticky_buzzer` | `init`、`beep` | 简短操作提示音 |
 | `sticky_sht40` | `init`、`read` | 温度和湿度 |
-| `sticky_rtc` | `init`、`read` | 只读日期和时间 |
+| `sticky_rtc` | `init`、`initialize_time`、`read` | 保留有效时间、初始化无效时间、读取时间 |
 | `sticky_battery` | `init`、`read` | 电池剩余电量 |
 | `sticky_charger` | `init`、`read` | 外部电源状态 |
 | `sticky_sdcard` | `init`、`read_text` | 从 MicroSD 读取文本文件 |
-| `sticky_imu` | `init`、`start_monitoring`、`get_state` | 稳定设备方向 |
+| `sticky_imu` | `init`、`start_monitoring`、`stop_monitoring`、`get_state` | 稳定设备方向和休眠准备 |
 | `sticky_microphone` | `init`、`capture` | 单次 PDM 音频测量 |
 | `sticky_power` | `enter_deep_sleep` | 进入深度睡眠并通过 AI 按键唤醒 |
 
@@ -187,7 +193,7 @@ GrayLevel::White
 ESP_ERROR_CHECK(sticky_display_refresh_partial());
 ```
 
-局刷 API 会在内部完成物理屏幕的 180 度坐标转换。它使用电子纸的黑白局刷波形，因此发生变化的区域应只包含 `Black` 和 `White` 像素。Dashboard 只在黑白页面中使用该 API 更新状态栏的 RTC 时间。
+局刷 API 会在内部完成物理屏幕的 180 度坐标转换，并提交整屏黑白比较帧，因此整个 Canvas 应只包含 `Black` 和 `White` 像素，只修改目标区域。逻辑局刷不代表 SPI 只传小窗口，尤其是 SSD2677。Dashboard 只在黑白页面中使用该 API 更新状态栏的 RTC 时间。
 
 ### 显示应用数据
 
@@ -198,7 +204,7 @@ sticky_sht40_read()
 -> update_environment(state)
 -> state.environment
 -> sensor_page_render(canvas, state)
--> sticky_display_refresh()
+-> sticky_display_refresh_monochrome()
 ```
 
 这样的分层可以让页面行为保持稳定，也方便在使用不同 UI 的应用中复用硬件模块。
@@ -234,19 +240,37 @@ Sensor、Battery、Note、IMU、Microphone 和深度睡眠页面使用黑白全�
 sticky_display_refresh_monochrome();
 ```
 
-黑白页面的 RTC 时间区域每分钟通过 `sticky_display_refresh_partial()` 更新一次。Home 页面不显示状态栏时间，其他页面内容不会在后台定时刷新。切换页面和短按 AI 刷新时，程序根据当前页面选择对应的全刷模式。
+黑白页面的 RTC 时间区域每分钟通过 `sticky_display_refresh_partial()` 更新一次。Home 不显示状态栏时间。Sensor、Battery、Note 在进入页面或 AI 刷新时重读；IMU 稳定方向变化会更新其页面，麦克风采集需要 AI 手动触发。切换页面和短按 AI 刷新时，根据当前页面选择对应全刷模式。
 
 `app/app_clock.cpp` 将第一次定时触发对齐到 RTC 的下一分钟，并发送 `AppEvent::ClockMinuteTick`。定时器回调不会直接访问 RTC 或屏幕，读取时间和执行局刷仍由正常的 App 事件循环负责。
 
-电子纸连续多次局刷后可能逐渐出现轻微残影，需要时可以短按 AI 进行一次普通全刷。电子纸全刷时出现短暂闪烁或旧画面属于正常现象。
+电子纸连续多次局刷后可能逐渐出现轻微残影。成功局刷 20 次后，下一次局刷请求转为黑白全刷；刷新失败后也要求完整帧恢复。需要时仍可短按 AI 全刷。全刷期间短暂闪烁或旧画面属于正常现象。
+
+事件队列空闲约一秒后请求面板 standby。SSD1677 灰阶刷新已关闭模拟电源和时钟，跳过额外 standby；下次刷新由官方组件恢复或重新初始化。一秒是 Demo 调度策略，不是面板时序参数。
+
+### RTC 时间
+
+启动时保留有效 RTC 时间。若成功读到的数据因 VL 标志、BCD 或日期而无效，写入示例时间 **2026-01-01 00:00:00** 并读回验证；芯片不可访问或 I2C 错误不触发写入。示例起点只用于展示走时，不是真实时间。现有 RTC 数值直接显示，不做时区转换或联网校时。RTC 持续供电时，复位和重新烧录不会重置有效时间。
+
+Battery 页的 **External power** 只表示外部电源输入，不表示实际充电电流或电池充满状态。
 
 ### MicroSD 重新读取
 
 每次进入 Note 页面或短按 AI 刷新时，程序都会重新读取 `TEST.TXT`。文件系统只在读取期间挂载，因此可以在两次读取之间拔出存储卡或修改文件。
 
+卸载清理失败时，页面会要求重启后再访问 SD；程序不复用可能已释放的卡对象，也不释放共享 SPI2。
+
 ### 深度睡眠
 
-进入睡眠前，程序会将 `AppState` 保存到 RTC 内存、停止触摸轮询、绘制黑白睡眠页面、关闭屏幕电源，并将 GPIO4 配置为唤醒源。唤醒时 ESP32-S3 会重新启动，并恢复睡眠前显示的页面。
+进入睡眠前，程序将带版本和校验的 `AppState` 保存到 RTC 内存，绘制黑白睡眠页面，停止分钟计时，暂停 IMU 和触摸轮询，再发送面板 sleep 命令。**EPD_EN 保持开启**；控制器休眠、关闭驱动高压和切断模块电源是不同操作。GPIO4 唤醒 ESP32-S3 后恢复原页面；保存状态无效或不兼容则回到 Home。准备失败时记录错误并尝试恢复正常操作。本 Demo 不承诺特定的睡眠电流指标。
+
+### 串口输出与错误
+
+INFO 展示控制器识别、页面切换、外设读数、实际刷新模式与实测刷新耗时、睡眠唤醒。常规 RTC 读取、standby 和传感器中间步骤使用 DEBUG。刷新耗时不包含此前的传感器读取和页面绘制。GPIO 配置及 SD 协议探测 INFO 默认隐藏，警告和错误保留。可选外设失败时对应页面提示不可用，其余功能继续；核心板级、显示和输入初始化失败会停止启动。
+
+## 硬件验证
+
+快速验收可依次检查控制器识别、六页切换、返回 Home 四灰阶、SD 文本重读、AI 麦克风采集、黑白页跨分钟更新、睡眠唤醒。唤醒时持续按住 AI 不应再次入睡。两种屏幕使用相同固件，除了日志也要检查设备实际图像。
 
 ## 引脚定义
 
@@ -285,3 +309,9 @@ sticky_display_refresh_monochrome();
 - 屏幕和触摸方向转换保留在对应设备模块中。
 
 遵守这些边界，就可以继续添加功能而不改变已有页面的行为。
+
+## 许可证
+
+本项目自有代码采用 [MIT 许可证](LICENSE)，版权归属 2026 Seeed Studio。
+随附的 Espressif 按钮组件保留其
+[Apache-2.0 许可证](components/button/license.txt)及源码版权声明。

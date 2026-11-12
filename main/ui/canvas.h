@@ -12,6 +12,8 @@ enum class GrayLevel : uint8_t {
 
 class Canvas {
 public:
+    // Caller owns the buffer. A complete frame needs ceil(width / 4) * height
+    // bytes; pixels outside the supplied capacity are safely ignored.
     Canvas(uint16_t width, uint16_t height, uint8_t *buffer, size_t buffer_size);
 
     uint16_t width() const { return width_; }

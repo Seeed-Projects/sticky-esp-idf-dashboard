@@ -1,10 +1,13 @@
 #include "app_clock.h"
 
 #include <cstdint>
+#include <atomic>
 
 #include "app_event.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 namespace {
 
@@ -14,26 +17,40 @@ constexpr int64_t kMinutePeriodUs = 60 * kMicrosecondsPerSecond;
 constexpr int64_t kRtcBoundaryMarginUs = 250000;
 
 esp_timer_handle_t s_minute_timer = nullptr;
+std::atomic<bool> s_running{false};
+SemaphoreHandle_t s_timer_lock = nullptr;
 
 void minute_timer_callback(void *)
 {
+    xSemaphoreTake(s_timer_lock, portMAX_DELAY);
+    if (!s_running.load()) {
+        xSemaphoreGive(s_timer_lock);
+        return;
+    }
     if (!app_event_post(AppEvent::ClockMinuteTick)) {
         ESP_LOGW(kTag, "Clock minute event queue is full");
     }
 
-    const esp_err_t result =
-        esp_timer_start_once(s_minute_timer, kMinutePeriodUs);
+    const esp_err_t result = s_running.load()
+        ? esp_timer_start_once(s_minute_timer, kMinutePeriodUs) : ESP_OK;
     if (result != ESP_OK) {
         ESP_LOGE(kTag, "Restart minute timer failed: %s",
                  esp_err_to_name(result));
     }
+    xSemaphoreGive(s_timer_lock);
 }
 
 }  // namespace
 
 esp_err_t app_clock_start(int rtc_second)
 {
-    if (s_minute_timer != nullptr) {
+    if (s_timer_lock == nullptr) {
+        s_timer_lock = xSemaphoreCreateMutex();
+        if (s_timer_lock == nullptr) return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreTake(s_timer_lock, portMAX_DELAY);
+    if (s_running.load()) {
+        xSemaphoreGive(s_timer_lock);
         return ESP_OK;
     }
 
@@ -43,8 +60,10 @@ esp_err_t app_clock_start(int rtc_second)
     timer_args.dispatch_method = ESP_TIMER_TASK;
     timer_args.name = "sticky_minute";
     timer_args.skip_unhandled_events = true;
-    esp_err_t result = esp_timer_create(&timer_args, &s_minute_timer);
+    esp_err_t result = s_minute_timer == nullptr
+        ? esp_timer_create(&timer_args, &s_minute_timer) : ESP_OK;
     if (result != ESP_OK) {
+        xSemaphoreGive(s_timer_lock);
         return result;
     }
 
@@ -55,10 +74,24 @@ esp_err_t app_clock_start(int rtc_second)
         seconds_until_next_minute * kMicrosecondsPerSecond +
         (rtc_second_valid ? kRtcBoundaryMarginUs : 0);
 
+    s_running.store(true);
     result = esp_timer_start_once(s_minute_timer, first_tick_delay);
     if (result != ESP_OK) {
-        esp_timer_delete(s_minute_timer);
-        s_minute_timer = nullptr;
+        s_running.store(false);
     }
+    xSemaphoreGive(s_timer_lock);
     return result;
+}
+
+esp_err_t app_clock_stop()
+{
+    if (s_timer_lock == nullptr) return ESP_OK;
+    xSemaphoreTake(s_timer_lock, portMAX_DELAY);
+    s_running.store(false);
+    const esp_err_t result = s_minute_timer != nullptr
+        ? esp_timer_stop(s_minute_timer) : ESP_OK;
+    xSemaphoreGive(s_timer_lock);
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) return result;
+    // Keep the handle for a possible failed-sleep recovery.
+    return ESP_OK;
 }

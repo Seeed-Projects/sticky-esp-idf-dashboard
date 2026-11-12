@@ -1,6 +1,7 @@
 #include "sticky_imu.h"
 
 #include <cmath>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -8,6 +9,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "pin_config.h"
 
 namespace {
@@ -21,7 +23,7 @@ constexpr uint8_t kAccelerometerControlRegister = 0x10;
 constexpr uint8_t kControlRegister3 = 0x12;
 constexpr uint8_t kAccelerometerOutputRegister = 0x28;
 constexpr uint8_t kAccelerometer104Hz2g = 0x40;
-constexpr uint8_t kRegisterAutoIncrement = 0x04;
+constexpr uint8_t kRegisterAutoIncrement = 0x44;  // BDU + IF_INC; keep +/-2g scale.
 constexpr float kAccelerationScaleG = 0.000061F;
 constexpr float kOrientationThresholdG = 0.70F;
 constexpr int kStableSampleCount = 5;
@@ -33,6 +35,8 @@ i2c_master_dev_handle_t s_device = nullptr;
 TaskHandle_t s_monitor_task = nullptr;
 portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 StickyImuState s_latest_state = {};
+SemaphoreHandle_t s_monitor_lock = nullptr;
+std::atomic<bool> s_monitor_enabled{false};
 
 esp_err_t write_register(uint8_t reg, uint8_t value)
 {
@@ -110,11 +114,18 @@ void monitor_task(void *)
     TickType_t next_read = xTaskGetTickCount();
 
     while (true) {
+        xSemaphoreTake(s_monitor_lock, portMAX_DELAY);
+        if (!s_monitor_enabled.load()) {
+            xSemaphoreGive(s_monitor_lock);
+            vTaskDelay(kPollInterval);
+            next_read = xTaskGetTickCount();
+            continue;
+        }
         StickyImuState sample = {};
         const esp_err_t result = read_acceleration(sample);
         if (result == ESP_OK) {
             if (sample.orientation == candidate) {
-                ++candidate_count;
+                if (candidate_count < kStableSampleCount) ++candidate_count;
             } else {
                 candidate = sample.orientation;
                 candidate_count = 1;
@@ -130,9 +141,11 @@ void monitor_task(void *)
                 store_state(sample);
             }
         } else {
+            store_state({});
             ESP_LOGE(kTag, "Accelerometer read failed: %s",
                      esp_err_to_name(result));
         }
+        xSemaphoreGive(s_monitor_lock);
 
         vTaskDelayUntil(&next_read, kPollInterval);
     }
@@ -191,17 +204,45 @@ esp_err_t sticky_imu_start_monitoring()
         return ESP_ERR_INVALID_STATE;
     }
     if (s_monitor_task != nullptr) {
-        return ESP_OK;
+        xSemaphoreTake(s_monitor_lock, portMAX_DELAY);
+        const esp_err_t result = write_register(kAccelerometerControlRegister,
+                                                kAccelerometer104Hz2g);
+        s_monitor_enabled.store(result == ESP_OK);
+        xSemaphoreGive(s_monitor_lock);
+        return result;
     }
+    if (s_monitor_lock == nullptr) {
+        s_monitor_lock = xSemaphoreCreateMutex();
+        if (s_monitor_lock == nullptr) return ESP_ERR_NO_MEM;
+    }
+    const esp_err_t result = write_register(kAccelerometerControlRegister,
+                                            kAccelerometer104Hz2g);
+    if (result != ESP_OK) return result;
+    s_monitor_enabled.store(true);
+    const BaseType_t created = xTaskCreate(monitor_task,
+                       "imu_monitor", kTaskStackSize, nullptr,
+                       kTaskPriority, &s_monitor_task);
+    if (created != pdPASS) {
+        s_monitor_enabled.store(false);
+        s_monitor_task = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
 
-    return xTaskCreate(monitor_task,
-                       "imu_monitor",
-                       kTaskStackSize,
-                       nullptr,
-                       kTaskPriority,
-                       &s_monitor_task) == pdPASS
-               ? ESP_OK
-               : ESP_ERR_NO_MEM;
+esp_err_t sticky_imu_stop_monitoring()
+{
+    if (s_monitor_task == nullptr) {
+        return s_device != nullptr
+            ? write_register(kAccelerometerControlRegister, 0) : ESP_OK;
+    }
+    if (xSemaphoreTake(s_monitor_lock, pdMS_TO_TICKS(500)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    s_monitor_enabled.store(false);
+    const esp_err_t result = write_register(kAccelerometerControlRegister, 0);
+    xSemaphoreGive(s_monitor_lock);
+    return result;
 }
 
 esp_err_t sticky_imu_get_state(StickyImuState &state)

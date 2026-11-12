@@ -26,6 +26,9 @@ esp_err_t sticky_imu_init(i2c_master_bus_handle_t bus);
 
 // Starts stable-orientation monitoring and posts AppEvent::OrientationChanged.
 esp_err_t sticky_imu_start_monitoring();
+// Pauses monitoring and powers down the accelerometer. start_monitoring()
+// restores sampling if deep-sleep preparation fails.
+esp_err_t sticky_imu_stop_monitoring();
 
 // Copies the latest stable state collected by the monitoring task.
 esp_err_t sticky_imu_get_state(StickyImuState &state);

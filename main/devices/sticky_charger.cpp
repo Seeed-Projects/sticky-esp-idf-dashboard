@@ -3,6 +3,10 @@
 #include "driver/gpio.h"
 #include "pin_config.h"
 
+namespace {
+bool s_initialized = false;
+}
+
 esp_err_t sticky_charger_init()
 {
     gpio_config_t enable_config = {};
@@ -29,11 +33,14 @@ esp_err_t sticky_charger_init()
     detect_config.pull_up_en = GPIO_PULLUP_DISABLE;
     detect_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
     detect_config.intr_type = GPIO_INTR_DISABLE;
-    return gpio_config(&detect_config);
+    result = gpio_config(&detect_config);
+    s_initialized = result == ESP_OK;
+    return result;
 }
 
 esp_err_t sticky_charger_read(bool &charging)
 {
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
     const int level = gpio_get_level(static_cast<gpio_num_t>(PIN_EXTERNAL_POWER));
     charging = level != 0;
     return ESP_OK;

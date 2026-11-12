@@ -66,11 +66,11 @@ void battery_page_render(Canvas &canvas, const AppState &state)
     }
     canvas.draw_text(550, 255, percent_text, 5, GrayLevel::Black);
 
-    const char *charging_text = "Charging: N/A";
+    const char *charging_text = "External power: N/A";
     if (state.battery.charging_valid) {
         charging_text = state.battery.charging
-                            ? "Charging: Yes"
-                            : "Charging: No";
+                            ? "External power: Yes"
+                            : "External power: No";
     }
-    canvas.draw_text(270, 390, charging_text, 3, GrayLevel::Black);
+    canvas.draw_text(230, 390, charging_text, 3, GrayLevel::Black);
 }

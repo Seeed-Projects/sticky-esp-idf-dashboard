@@ -1,6 +1,7 @@
 #include "sticky_touch.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 
 #include "app_event.h"
@@ -28,7 +29,10 @@ constexpr TickType_t kStopTimeout = pdMS_TO_TICKS(200);
 i2c_master_bus_handle_t s_touch_bus = nullptr;
 GT911 s_controller;
 TaskHandle_t s_touch_task = nullptr;
-volatile bool s_stop_requested = false;
+std::atomic<bool> s_stop_requested{false};
+std::atomic<bool> s_task_running{false};
+std::atomic<bool> s_polling_paused{false};
+bool s_controller_ready = false;
 bool s_touching = false;
 uint16_t s_start_x = 0;
 uint16_t s_start_y = 0;
@@ -113,13 +117,20 @@ void touch_task(void *)
     TickType_t next_poll = xTaskGetTickCount();
     while (true) {
         if (s_stop_requested) {
-            break;
+            s_polling_paused.store(true);
+            vTaskDelay(kPollInterval);
+            next_poll = xTaskGetTickCount();
+            continue;
         }
+        s_polling_paused.store(false);
 
         GTPoint point = {};
         const int8_t count = s_controller.read_points(&point, 1);
 
-        if (count > 0) {
+        if (count == GT911::kNoUpdate) {
+            // No fresh report is not a release. Preserve the swipe until a
+            // valid zero-point report arrives, as in the official adapter.
+        } else if (count > 0) {
             transform_touch_coordinate(point.x, point.y, s_last_x, s_last_y);
             if (!s_touching) {
                 s_start_x = s_last_x;
@@ -146,14 +157,28 @@ void touch_task(void *)
         vTaskDelayUntil(&next_poll, kPollInterval);
     }
 
-    s_touch_task = nullptr;
-    vTaskDelete(nullptr);
 }
 
 }  // namespace
 
 esp_err_t sticky_touch_init()
 {
+    if (s_task_running.load()) {
+        s_polling_paused.store(false);
+        s_stop_requested.store(false);
+        return ESP_OK;
+    }
+    if (s_controller_ready) {
+        s_stop_requested.store(false);
+        s_touching = false;
+        s_task_running.store(true);
+        if (xTaskCreate(touch_task, "sticky_touch", kTaskStackSize, nullptr,
+                        kTaskPriority, &s_touch_task) != pdPASS) {
+            s_task_running.store(false);
+            return ESP_ERR_NO_MEM;
+        }
+        return ESP_OK;
+    }
     s_stop_requested = false;
     gpio_config_t power_config = {};
     power_config.pin_bit_mask = 1ULL << PIN_TOUCH_EN;
@@ -179,7 +204,8 @@ esp_err_t sticky_touch_init()
     bus_config.clk_source = I2C_CLK_SRC_DEFAULT;
     bus_config.glitch_ignore_cnt = 7;
     bus_config.flags.enable_internal_pullup = 1;
-    result = i2c_new_master_bus(&bus_config, &s_touch_bus);
+    result = s_touch_bus == nullptr
+        ? i2c_new_master_bus(&bus_config, &s_touch_bus) : ESP_OK;
     if (result != ESP_OK) {
         return result;
     }
@@ -190,8 +216,10 @@ esp_err_t sticky_touch_init()
                             kDisplayHeight,
                             s_touch_bus)) {
         ESP_LOGE(kTag, "GT911 initialization failed");
+        s_controller.deinit();
         return ESP_FAIL;
     }
+    s_controller_ready = true;
 
     uint16_t sensor_width = 0;
     uint16_t sensor_height = 0;
@@ -200,12 +228,14 @@ esp_err_t sticky_touch_init()
              sensor_width, sensor_height,
              kDisplayWidth, kDisplayHeight, s_controller.address());
 
+    s_task_running.store(true);
     if (xTaskCreate(touch_task,
                     "sticky_touch",
                     kTaskStackSize,
                     nullptr,
                     kTaskPriority,
                     &s_touch_task) != pdPASS) {
+        s_task_running.store(false);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -213,13 +243,13 @@ esp_err_t sticky_touch_init()
 
 esp_err_t sticky_touch_stop()
 {
-    if (s_touch_task == nullptr) {
+    if (!s_task_running.load()) {
         return ESP_OK;
     }
 
     s_stop_requested = true;
     const TickType_t deadline = xTaskGetTickCount() + kStopTimeout;
-    while (s_touch_task != nullptr) {
+    while (!s_polling_paused.load()) {
         if (static_cast<int32_t>(xTaskGetTickCount() - deadline) >= 0) {
             ESP_LOGE(kTag, "Timed out while stopping touch task");
             return ESP_ERR_TIMEOUT;

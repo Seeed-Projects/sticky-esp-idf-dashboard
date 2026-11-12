@@ -31,6 +31,9 @@ void Canvas::draw_pixel(int x, int y, GrayLevel color)
     }
 
     const size_t index = static_cast<size_t>(y) * stride_ + static_cast<size_t>(x) / 4U;
+    if (index >= buffer_size_) {
+        return;
+    }
     const uint8_t shift = static_cast<uint8_t>((3 - (x & 0x03)) * 2);
     const uint8_t mask = static_cast<uint8_t>(0x03U << shift);
     const uint8_t value = static_cast<uint8_t>(color) << shift;

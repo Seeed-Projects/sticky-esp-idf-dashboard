@@ -6,3 +6,4 @@
 // Pass -1 when the RTC second is unavailable; the first tick then occurs
 // after one minute.
 esp_err_t app_clock_start(int rtc_second);
+esp_err_t app_clock_stop();

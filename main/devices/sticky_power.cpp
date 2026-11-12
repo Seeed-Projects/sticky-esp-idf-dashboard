@@ -53,7 +53,7 @@ void sticky_power_log_wakeup_reason()
         static_cast<gpio_num_t>(PIN_POWER_HOLD), 1));
     ESP_ERROR_CHECK(hold_output(
         static_cast<gpio_num_t>(PIN_POWER_LOCK), 1));
-    ESP_ERROR_CHECK(hold_output(static_cast<gpio_num_t>(PIN_EPD_EN), 0));
+    ESP_ERROR_CHECK(hold_output(static_cast<gpio_num_t>(PIN_EPD_EN), 1));
     ESP_ERROR_CHECK(hold_output(static_cast<gpio_num_t>(PIN_TOUCH_EN), 0));
     ESP_ERROR_CHECK(hold_output(static_cast<gpio_num_t>(PIN_TOUCH_RST), 0));
     ESP_ERROR_CHECK(hold_output(static_cast<gpio_num_t>(PIN_MIC_EN), 0));

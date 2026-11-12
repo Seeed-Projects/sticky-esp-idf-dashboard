@@ -1,7 +1,6 @@
 #include "epaper_panel_priv.h"
 
 #include <stdlib.h>
-#include <stdatomic.h>
 #include <string.h>
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -27,7 +26,6 @@ static const uint32_t kSsd2677BusyTimeoutMs = 30000U;
 static const uint16_t kSsd2677ResetLowMs = 20U;
 static const uint16_t kSsd2677ResetHighMs = 10U;
 static const uint8_t kSsd2677ChipId = 0x07U;
-static atomic_bool s_busy_wait_active = ATOMIC_VAR_INIT(false);
 
 static size_t packed_mono_stride(uint16_t width);
 static size_t packed_2bpp_stride(uint16_t width);
@@ -35,11 +33,6 @@ static size_t packed_2bpp_stride(uint16_t width);
 static uint64_t epaper_log_ms(void)
 {
     return (uint64_t)(esp_timer_get_time() / 1000ULL);
-}
-
-bool seeed_epaper_panel_busy_wait_active(void)
-{
-    return atomic_load_explicit(&s_busy_wait_active, memory_order_acquire);
 }
 
 static const char *refresh_mode_name(seeed_epaper_refresh_mode_t mode)
@@ -706,10 +699,8 @@ esp_err_t seeed_epaper_panel_wait_ready(seeed_epaper_panel_t *panel)
              (unsigned)panel->config.busy_level,
              (int)done_edge,
              (unsigned)panel->config.busy_timeout_ms);
-    atomic_store_explicit(&s_busy_wait_active, true, memory_order_release);
     esp_err_t intr_err = gpio_set_intr_type(panel->config.pin_busy, done_edge);
     if (intr_err != ESP_OK) {
-        atomic_store_explicit(&s_busy_wait_active, false, memory_order_release);
         ESP_LOGE(TAG, "enable busy interrupt failed: %s", esp_err_to_name(intr_err));
         return intr_err;
     }
@@ -722,7 +713,6 @@ esp_err_t seeed_epaper_panel_wait_ready(seeed_epaper_panel_t *panel)
                  (int)panel->config.pin_busy,
                  level,
                  (unsigned long long)(epaper_log_ms() - start_ms));
-        atomic_store_explicit(&s_busy_wait_active, false, memory_order_release);
         return ESP_OK;
     }
 
@@ -737,7 +727,6 @@ esp_err_t seeed_epaper_panel_wait_ready(seeed_epaper_panel_t *panel)
                  (unsigned)panel->config.busy_level,
                  (unsigned long long)(epaper_log_ms() - start_ms),
                  (unsigned)panel->config.busy_timeout_ms);
-        atomic_store_explicit(&s_busy_wait_active, false, memory_order_release);
         return ESP_ERR_TIMEOUT;
     }
     APP_EPAPER_DEBUG_LOGI(TAG,
@@ -745,7 +734,6 @@ esp_err_t seeed_epaper_panel_wait_ready(seeed_epaper_panel_t *panel)
              (int)panel->config.pin_busy,
              level,
              (unsigned long long)(epaper_log_ms() - start_ms));
-    atomic_store_explicit(&s_busy_wait_active, false, memory_order_release);
     return ESP_OK;
 }
 

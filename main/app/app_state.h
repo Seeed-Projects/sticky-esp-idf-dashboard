@@ -2,6 +2,7 @@
 
 #include "esp_err.h"
 #include "sticky_imu.h"
+#include "sticky_sdcard.h"
 
 enum class PageId {
     Home,
@@ -34,12 +35,13 @@ struct BatteryState {
     int percent = 0;
     bool valid = false;
     esp_err_t error = ESP_ERR_INVALID_STATE;
-    bool charging = false;
+    bool charging = false;  // External power present; not measured charge state.
     bool charging_valid = false;
     esp_err_t charging_error = ESP_ERR_INVALID_STATE;
 };
 
 struct NoteState {
+    StickySdReadResult result;
     char text[257] = {};
     bool valid = false;
     esp_err_t error = ESP_ERR_INVALID_STATE;

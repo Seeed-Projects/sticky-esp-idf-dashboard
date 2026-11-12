@@ -55,7 +55,7 @@ esp_err_t sticky_sht40_read(Sht40Reading &reading)
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(kTag, "Starting measurement at address 0x%02X",
+    ESP_LOGD(kTag, "Starting measurement at address 0x%02X",
              SHT40_I2C_ADDR);
 
     // Register the sensor only for the duration of this measurement. This
@@ -81,27 +81,14 @@ esp_err_t sticky_sht40_read(Sht40Reading &reading)
         ESP_LOGE(kTag, "Send measurement command 0x%02X failed: %s",
                  kMeasureHighPrecision, esp_err_to_name(result));
 
-        // Recover a bus left busy by a reset or an interrupted transaction,
-        // then retry once. This stays in the device layer so callers keep a
-        // simple read API.
-        ESP_LOGW(kTag, "Resetting sensor I2C bus and retrying once");
-        const esp_err_t reset_result = i2c_master_bus_reset(s_bus);
-        if (reset_result == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(kRetryDelayMs));
-            result = i2c_master_transmit(
-                device, &kMeasureHighPrecision, 1, kI2cTimeoutMs);
-            if (result == ESP_OK) {
-                ESP_LOGI(kTag, "Measurement command accepted after bus reset");
-            } else {
-                ESP_LOGE(kTag, "Retry failed: %s", esp_err_to_name(result));
-            }
-        } else {
-            ESP_LOGE(kTag, "Sensor I2C bus reset failed: %s",
-                     esp_err_to_name(reset_result));
-        }
+        // Retry the transaction without resetting the shared bus while the
+        // IMU monitor may be active. A persistent fault is reported to the page.
+        vTaskDelay(pdMS_TO_TICKS(kRetryDelayMs));
+        result = i2c_master_transmit(
+            device, &kMeasureHighPrecision, 1, kI2cTimeoutMs);
     }
     if (result == ESP_OK) {
-        ESP_LOGI(kTag, "Measurement command accepted; waiting 10 ms");
+        ESP_LOGD(kTag, "Measurement command accepted; waiting 10 ms");
         vTaskDelay(kMeasurementTime);
         result = i2c_master_receive(
             device, data, sizeof(data), kI2cTimeoutMs);

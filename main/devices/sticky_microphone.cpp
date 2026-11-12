@@ -94,10 +94,12 @@ esp_err_t sticky_microphone_capture(MicrophoneReading &reading)
     }
 
     s_capturing = true;
+    bool channel_enabled = false;
     esp_err_t result = set_power(true);
     if (result == ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(kPowerOnDelayMs));
         result = i2s_channel_enable(s_rx_channel);
+        channel_enabled = result == ESP_OK;
     }
 
     double sum_centered_squares = 0.0;
@@ -109,9 +111,9 @@ esp_err_t sticky_microphone_capture(MicrophoneReading &reading)
         size_t bytes_read = 0;
         result = i2s_channel_read(s_rx_channel,
                                   samples,
-                                  sizeof(samples),
+                                  std::min(kSamplesPerRead, kCaptureSampleCount - processed_samples) * sizeof(samples[0]),
                                   &bytes_read,
-                                  pdMS_TO_TICKS(kReadTimeoutMs));
+                                  kReadTimeoutMs);
         const size_t sample_count = bytes_read / sizeof(samples[0]);
         if (result != ESP_OK || sample_count == 0) {
             if (result == ESP_OK) {
@@ -134,7 +136,8 @@ esp_err_t sticky_microphone_capture(MicrophoneReading &reading)
         processed_samples += sample_count;
     }
 
-    const esp_err_t disable_result = i2s_channel_disable(s_rx_channel);
+    const esp_err_t disable_result = channel_enabled
+        ? i2s_channel_disable(s_rx_channel) : ESP_OK;
     const esp_err_t power_result = set_power(false);
     s_capturing = false;
 
